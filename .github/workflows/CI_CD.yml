@@ -93,6 +93,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           token: ${{ secrets.PAT_TOKEN }}
+          ref: ${{ github.ref }}
 
       - name: Build firmware
         run: |
@@ -107,10 +108,12 @@ jobs:
           mkdir -p "${DIST}"
 
           # Copy firmware binaries (ota_data_initial may not exist in some builds)
-          cp build/bootloader/bootloader.bin "${DIST}/"
-          cp build/partition_table/partition-table.bin "${DIST}/"
-          cp build/cuktech_ble.bin "${DIST}/"
-          [ -f build/ota_data_initial.bin ] && cp build/ota_data_initial.bin "${DIST}/"
+          BUILD_DIR="."
+          [ -d esp32_ble/build ] && BUILD_DIR="esp32_ble"
+          cp "${BUILD_DIR}/build/bootloader/bootloader.bin" "${DIST}/"
+          cp "${BUILD_DIR}/build/partition_table/partition-table.bin" "${DIST}/"
+          cp "${BUILD_DIR}/build/cuktech_ble.bin" "${DIST}/"
+          [ -f "${BUILD_DIR}/build/ota_data_initial.bin" ] && cp "${BUILD_DIR}/build/ota_data_initial.bin" "${DIST}/"
 
           # Determine flash params
           FLASH_MODE="dio"; FLASH_SIZE="4MB"
