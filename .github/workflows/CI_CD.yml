@@ -1,0 +1,206 @@
+name: Sync, Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: '强制发布 Release（即使版本未变更）'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 */2 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      changed: ${{ steps.version.outputs.changed }}
+      notes: ${{ steps.notes.outputs.notes }}
+    steps:
+      - name: Clone this repo
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Clone upstream
+        run: |
+          git clone https://${{ secrets.PAT_TOKEN }}@github.com/kairui1108/cuktech-ble-ha.git /tmp/upstream
+
+      - name: Check version change
+        id: version
+        run: |
+          UPSTREAM_VER=$(grep '^## v' /tmp/upstream/esp32_ble/RELEASE_NOTE.md | head -1 | sed 's/## v//')
+          CURRENT_VER=$(grep '^## v' RELEASE_NOTE.md 2>/dev/null | head -1 | sed 's/## v//' || echo "0.0.0")
+          echo "version=$UPSTREAM_VER" >> $GITHUB_OUTPUT
+          echo "upstream=$UPSTREAM_VER" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT_VER" >> $GITHUB_OUTPUT
+          if [ "$UPSTREAM_VER" != "$CURRENT_VER" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Sync files
+        run: |
+          rsync -av --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='build' \
+            --exclude='sdkconfig' \
+            --exclude='*.pyc' \
+            /tmp/upstream/esp32_ble/ ./
+          cp /tmp/upstream/docs/esp32-readme.md README.md
+          cp /tmp/upstream/docs/esp32-readme-en.md README.en.md
+
+      - name: Extract release notes
+        id: notes
+        run: |
+          VERSION="${{ steps.version.outputs.upstream }}"
+          if [ -f RELEASE_NOTE.md ]; then
+            NOTES=$(awk -v ver="${VERSION}" 'BEGIN{f=0} $0 ~ ("^## v" ver){f=1; next} f && $0 ~ "^## v" {exit} f{print}' RELEASE_NOTE.md)
+          fi
+          NOTES="${NOTES:-See commit history for changes.}"
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/kairui1108/cuktech-ble-esp32.git
+          git add .
+          if ! git diff --cached --quiet; then
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git commit -m "Sync esp32_ble from upstream (${TIMESTAMP})"
+            git push origin HEAD
+          fi
+
+  build:
+    needs: sync
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [esp32, esp32s3, esp32c3]
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.3.5
+    steps:
+      - name: Checkout synced code
+        uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Build firmware
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py set-target ${{ matrix.target }}
+          idf.py build
+
+      - name: Prepare artifacts and zip
+        run: |
+          TARGET=${{ matrix.target }}
+          DIST="dist/${TARGET}"
+          mkdir -p "${DIST}"
+
+          # Copy firmware binaries (ota_data_initial may not exist in some builds)
+          cp build/bootloader/bootloader.bin "${DIST}/"
+          cp build/partition_table/partition-table.bin "${DIST}/"
+          cp build/cuktech_ble.bin "${DIST}/"
+          [ -f build/ota_data_initial.bin ] && cp build/ota_data_initial.bin "${DIST}/"
+
+          # Determine flash params
+          FLASH_MODE="dio"; FLASH_SIZE="4MB"
+          if [ "${TARGET}" = "esp32s3" ]; then
+            FLASH_MODE="qio"; FLASH_SIZE="8MB"
+          fi
+
+          # Write flash script
+          cat > "${DIST}/flash.py" << PYEOF
+          #!/usr/bin/env python3
+          """Flash CUKTECH BLE firmware to ${TARGET}."""
+          import subprocess, os
+          DIR = os.path.dirname(os.path.abspath(__file__))
+          cmd = [
+              "python", "-m", "esptool", "--chip", "${TARGET}", "-b", "460800",
+              "--before", "default-reset", "--after", "hard-reset",
+              "write-flash", "--flash-mode", "${FLASH_MODE}", "--flash-size", "${FLASH_SIZE}",
+              "0x1000", os.path.join(DIR, "bootloader.bin"),
+              "0x8000", os.path.join(DIR, "partition-table.bin"),
+              "0x10000", os.path.join(DIR, "cuktech_ble.bin"),
+          ]
+          if os.path.exists(os.path.join(DIR, "ota_data_initial.bin")):
+              cmd += ["0x310000", os.path.join(DIR, "ota_data_initial.bin")]
+          print(f"Flashing ${TARGET}...")
+          subprocess.run(cmd, check=True)
+          print("Done!")
+          PYEOF
+          chmod +x "${DIST}/flash.py"
+
+          # Zip it
+          cd dist
+          zip -r "cuktech-ble-${TARGET}.zip" "${TARGET}/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cuktech-ble-${{ matrix.target }}
+          path: dist/cuktech-ble-${{ matrix.target }}.zip
+
+  release:
+    needs: [sync, build]
+    if: needs.sync.outputs.changed == 'true' || inputs.force_release == true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          cp artifacts/cuktech-ble-esp32/cuktech-ble-esp32.zip release/
+          cp artifacts/cuktech-ble-esp32s3/cuktech-ble-esp32s3.zip release/
+          cp artifacts/cuktech-ble-esp32c3/cuktech-ble-esp32c3.zip release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ needs.sync.outputs.version }}
+          name: v${{ needs.sync.outputs.version }}
+          body: |
+            ${{ needs.sync.outputs.notes }}
+
+            ## 下载
+
+            | 平台 | 文件 |
+            |---|---|
+            | **ESP32** | `cuktech-ble-esp32.zip` |
+            | **ESP32-S3** | `cuktech-ble-esp32s3.zip` |
+            | **ESP32-C3** | `cuktech-ble-esp32c3.zip` |
+
+            每个 zip 包含: `bootloader.bin`, `partition-table.bin`, `cuktech_ble.bin`, `ota_data_initial.bin`, `flash.py`
+
+            ## 首次烧录
+
+            ```bash
+            pip install esptool
+            unzip cuktech-ble-<target>.zip
+            cd <target>/
+            python flash.py
+            ```
+
+            ## OTA 更新
+
+            仅需 `cuktech_ble.bin`，通过 ESP32 Web 面板上传即可。
+          files: |
+            release/cuktech-ble-esp32.zip
+            release/cuktech-ble-esp32s3.zip
+            release/cuktech-ble-esp32c3.zip
+          token: ${{ secrets.PAT_TOKEN }}
