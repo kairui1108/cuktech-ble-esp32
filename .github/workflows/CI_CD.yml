@@ -128,40 +128,28 @@ jobs:
             FLASH_MODE="qio"; FLASH_SIZE="8MB"
           fi
 
-          # Write flash script (auto-detects hyphen vs underscore args)
+          # Write flash script
           cat > "${DIST}/flash.py" << PYEOF
           #!/usr/bin/env python3
-          """Flash CUKTECH BLE firmware to ${TARGET}."""
           import subprocess, os, sys
           DIR = os.path.dirname(os.path.abspath(__file__))
+          TARGET = "${TARGET}"
+          FLASH_MODE = "${FLASH_MODE}"
+          FLASH_SIZE = "${FLASH_SIZE}"
 
-          def _fmt(*names):
-              \"\"\"Probe esptool to pick right arg format (hyphen vs underscore).\"\"\"
-              try:
-                  out = subprocess.run(
-                      ["python", "-m", "esptool", "--help"],
-                      capture_output=True, text=True, timeout=5).stdout
-                  for n in names:
-                      if n in out:
-                          return n
-              except Exception:
-                  pass
-              return names[-1]  # fallback to underscore
-
-          before = _fmt("default-reset", "default_reset")
-          after  = _fmt("hard-reset",    "hard_reset")
-          op     = _fmt("write-flash",   "write_flash")
-          fm_opt = _fmt("--flash-mode",  "--flash_mode")
-          fs_opt = _fmt("--flash-size",  "--flash_size")
-          port   = sys.argv[1] if len(sys.argv) > 1 else "/dev/ttyUSB0"
+          _py = sys.executable or "python3"
           cmd = [
-              "python", "-m", "esptool", "--chip", "${TARGET}", "-p", port,
+              _py, "-m", "esptool", "--chip", TARGET,
               "-b", "460800",
-              "--before", before, "--after", after,
-              op, fm_opt, "${FLASH_MODE}", fs_opt, "${FLASH_SIZE}",
+              "--before", "default-reset", "--after", "hard-reset",
+              "write-flash", "--flash-mode", FLASH_MODE, "--flash-size", FLASH_SIZE,
               "0x0", os.path.join(DIR, "firmware.bin"),
           ]
-          print(f"Flashing ${TARGET}...")
+
+          if len(sys.argv) > 1:
+              cmd[3:3] = ["-p", sys.argv[1]]
+
+          print(f"Flashing {TARGET}...")
           subprocess.run(cmd, check=True)
           print("Done!")
           PYEOF
