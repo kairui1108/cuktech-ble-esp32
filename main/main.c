@@ -179,6 +179,7 @@ static cJSON* get_port_data_json(void) {
         const char *proto = port_data[i].active ? get_proto_name(port_data[i].protocol) : "idle";
         cJSON_AddStringToObject(obj, "protocol", proto);
         cJSON_AddBoolToObject(obj, "active", port_data[i].active);
+        cJSON_AddNumberToObject(obj, "status", port_data[i].status);
         cJSON_AddItemToArray(arr, obj);
     }
     UNLOCK_STATE();
