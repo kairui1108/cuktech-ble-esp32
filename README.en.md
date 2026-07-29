@@ -2,12 +2,13 @@
 
 [中文](esp32-readme.md)
 
-Bridge your CUKTECH charger to Home Assistant and Bemfa cloud via ESP32.
+Bridge your CUKTECH charger to Home Assistant and Bemfa cloud via ESP32. The ESP32 itself serves a full web UI — no external services required for setup, real-time monitoring, and control.
 
 ```
 Charger ←BLE→ ESP32 ──MQTT──→ Home Assistant
          │            ├──Bemfa──→ XiaoAi / XiaoDu
-         │            ├── HTTP (Config page / Dashboard / OTA)
+         │            ├── HTTP built-in Web Dashboard ──→ Browser direct control
+         │            │     (Dashboard / Config, zero-dependency)
          │            └── NVS (Persistent config storage)
 ```
 
@@ -82,16 +83,15 @@ You need the following from your charger (via Xiaomi Home / MiJia app):
 
 > Use [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) to extract them.
 
-## Web Dashboard
+## Web Dashboard (Zero-Dependency)
 
-Once connected, open the ESP32's IP address in a browser:
+The firmware includes a complete built-in web UI. Once connected, open the ESP32's IP address in any browser — no Home Assistant, no MQTT broker, no external services required.
 
 - Real-time voltage / current / power per port
 - Port on/off control
 - Protocol switching (PD / PPS / UFCS / SCP)
 - Scene mode selection
 - BLE connection toggle
-- OTA firmware update
 
 ## File Structure
 

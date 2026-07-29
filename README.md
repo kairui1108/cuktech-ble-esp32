@@ -2,12 +2,13 @@
 
 [English](esp32-readme-en.md)
 
-将酷态科充电器通过 ESP32 接入 Home Assistant 和巴法云。
+将酷态科充电器通过 ESP32 接入 Home Assistant 和巴法云。ESP32 本身即提供完整的 Web 控制界面，无需依赖任何外部服务即可完成配置和监控。
 
 ```
 充电器 ←BLE→ ESP32 ──MQTT──→ Home Assistant
          │            ├──巴法云──→ 小爱同学 / 小度
-         │            ├── HTTP（配置页 / 仪表盘 / OTA）
+         │            ├── HTTP 内置 Web 界面 ──→ 浏览器直接控制
+         │            │     （仪表盘 / 配置, 零依赖）
          │            └── NVS（配置持久化）
 ```
 
@@ -81,16 +82,15 @@ idf.py -p /dev/ttyUSB0 flash
 
 > 可使用 [Xiaomi-cloud-tokens-extractor](https://github.com/PiotrMachowski/Xiaomi-cloud-tokens-extractor) 获取。
 
-## Web 面板
+## Web 面板（零依赖）
 
-连接成功后，浏览器访问 ESP32 的 IP 地址即可打开内置仪表盘：
+固件内置完整 Web 控制界面，连接成功后直接在浏览器访问 ESP32 的 IP 地址即可使用——无需 Home Assistant、无需 MQTT 服务器、无需任何外部依赖。
 
 - 实时查看各端口电压 / 电流 / 功率
 - 端口开关控制
 - 协议开关（PD / PPS / UFCS / SCP）
 - 场景模式切换
 - BLE 连接开关
-- OTA 固件更新
 
 ## 文件结构
 

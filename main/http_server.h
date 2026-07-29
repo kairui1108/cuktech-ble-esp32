@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include "config_store.h"
 #include "cJSON.h"
 
@@ -19,3 +20,5 @@ void http_server_set_callbacks(port_data_cb ports, settings_cb settings,
                                port_control_cb port_ctl, setting_set_cb setting_set,
                                protocol_toggle_cb proto_toggle,
                                ble_control_cb ble_ctl);
+/* GC: reset cJSON pool, return peak usage. Call on heap pressure. */
+size_t http_server_pool_gc(void);

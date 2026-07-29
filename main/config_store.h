@@ -17,6 +17,12 @@ typedef struct {
     bool mqtt_enable;
     bool bemfa_enable;
     char bemfa_uid[33];
+    char bemfa_name_c1[32];
+    char bemfa_name_c2[32];
+    char bemfa_name_c3[32];
+    char bemfa_name_a[32];
+    char bemfa_name_ble[32];
+    bool bemfa_modified;
     bool valid;
 } DeviceConfig;
 

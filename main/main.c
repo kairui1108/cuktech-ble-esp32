@@ -12,13 +12,14 @@
 #include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_wifi.h"
+#include "esp_coexist.h"
+#include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
 
 #include "config.h"
 #include "config_store.h"
 #include "http_server.h"
-#include "ota_update.h"
 #include "bemfa.h"
 
 #if ENABLE_MQTT
@@ -28,6 +29,7 @@
 
 #include "queue_msg.h"
 #include "ble_manager.h"
+#include "miot_protocol_shared.h"
 
 static const char* TAG = "MAIN";
 static DeviceConfig g_cfg;
@@ -38,6 +40,12 @@ static DeviceConfig g_cfg;
 QueueHandle_t cmd_queue = NULL;
 QueueHandle_t urgent_queue = NULL;  // higher priority: port commands, user SETs
 QueueHandle_t result_queue = NULL;
+
+// Semaphore for delayed BLE connection.
+// Created in system_manager, taken by ble_task to wait (timeout = BLE_CONNECT_DELAY_S s).
+// Given by handle_ble_control() when frontend user clicks "连接设备".
+static SemaphoreHandle_t ble_connect_sem = NULL;
+#define BLE_CONNECT_DELAY_S 60
 
 // ============================================================
 // Shared state
@@ -96,81 +104,28 @@ static const char* get_proto_name(uint8_t code) {
     return (code < PROTO_NAMES_LEN) ? PROTO_NAMES[code] : "?";
 }
 
-static const float PD_FIXED_VOLTAGES[] = {5.0, 9.0, 12.0, 15.0, 20.0};
-
-// Extract PDO kind for a port from settings[17/18]
-// kind==0x07 = PD Fixed, kind==0x08 = PD PPS
-static int _get_pdo_kind(int idx) {
-    uint32_t pdo_word = (idx < 2) ? settings[17] : settings[18];
-    uint16_t port_val = (idx % 2 == 0) ? (pdo_word & 0xFFFF) : (pdo_word >> 16);
-    return (port_val >> 8) & 0xFF; // high byte = kind
-}
-
-static float _min_dist_to_pd(float voltage) {
-    float d = fabsf(voltage - PD_FIXED_VOLTAGES[0]);
-    for (int i = 1; i < 5; i++) {
-        float nd = fabsf(voltage - PD_FIXED_VOLTAGES[i]);
-        if (nd < d) d = nd;
-    }
-    return d;
-}
-
-// PD vs PPS subtype estimation — matches Python _estimate_pd_subtype
-static uint8_t _pd_subtype(float voltage) {
-    float md = _min_dist_to_pd(voltage);
-    if (voltage < 12.0f) {
-        if (md <= 0.05f) return 7;   // PD (exact match to PD fixed standard)
-        return 8;                     // PPS
-    }
-    if (md <= 0.3f) return 7;        // PD
-    if (voltage >= 3.0f && voltage <= 21.0f) return 8;  // PPS
-    return 7;
-}
-
 static uint8_t estimate_protocol(uint8_t piid, float voltage, uint8_t code,
-                                  uint32_t caps, bool pd_enabled) {
-    if (piid == 1 || piid == 2) {
-        int idx = piid - 1;
-        if (!pd_enabled && voltage > 0) return 1;
-        if (code == 0x08) return 8;
-        if (code == 0x70) {
-            if (_min_dist_to_pd(voltage) <= 0.3f) return 7;
-            return 3;
+                                  uint32_t caps, bool pd_enabled, uint8_t hw_protocol) {
+    /* Hardware protocol code (from PIID 17/18) takes priority. */
+    if (hw_protocol > 0) return hw_protocol;
+
+    int idx = piid - 1;
+    bool pps_enabled = false;
+    uint8_t pdo_kind = 0;
+    if (idx == 0 || idx == 1) {
+        int pps_bit = (idx == 0) ? 1 : 9;
+        pps_enabled = (protocol_extend_val >> pps_bit) & 1;
+        if (settings_valid[17]) {
+            uint16_t port_word = (idx == 0) ? (settings[17] & 0xFFFF) : ((settings[17] >> 16) & 0xFFFF);
+            pdo_kind = (port_word >> 8) & 0xFF;
         }
-        if (code == 0x01 || code == 0x03 || code == 0x04 || code == 0x05 ||
-            code == 0x06 || code == 0x07 || code == 0x0A || code == 0x0B || code == 0x30) {
-            int pdo_kind = settings_valid[17] ? _get_pdo_kind(idx) : 0;
-            if (pdo_kind == 0x08) {  // PDO PPS
-                float md = _min_dist_to_pd(voltage);
-                if (md <= 0.05f) return 7;   // exact PD fixed match
-                return 8;                     // PPS
-            } else if (pdo_kind == 0x07) {    // PDO PD Fixed
-                // If PPS enabled (from protocol_extend) and voltage < 12V → could be PPS
-                // Simplified: use _pd_subtype
-                return _pd_subtype(voltage);
-            }
-            // No PDO data — use voltage-based estimation
-            return _pd_subtype(voltage);
+    } else if (piid == 3) {
+        if (settings_valid[18]) {
+            pdo_kind = ((settings[18] & 0xFFFF) >> 8) & 0xFF;
         }
-        // Other codes — voltage fallback (matches Python loose match + PPS range)
-        float md = _min_dist_to_pd(voltage);
-        if (md <= 0.5f) return 7;
-        if (voltage >= 3.0f && voltage <= 21.0f) return 8;
-        return 0;
     }
-    if (piid == 3) {
-        if (code == 0x70) return 3;
-        if (voltage >= 15.0) return 7;
-        if (voltage >= 8.5) return 3;
-        if (voltage <= 5.5) return 1;
-        return voltage > 6.0 ? 3 : 1;
-    }
-    if (piid == 4) {
-        if (code == 0x70) return 3;
-        if (voltage > 5.5) return 3;
-        if (voltage > 0) return 1;
-    }
-    return 0;
+
+    return estimate_protocol_shared(piid, voltage, code, pd_enabled, pps_enabled, pdo_kind, hw_protocol);
 }
 
 // ============================================================
@@ -309,6 +264,11 @@ static bool handle_protocol_toggle(const char *port, const char *protocol, bool 
 static bool handle_ble_control(bool enable) {
     ble_enabled = enable;
     ble_manager_set_enabled(enable);
+    if (enable && ble_connect_sem) {
+        /* Give the semaphore to wake up ble_task early (if it's still
+           in the delayed-start window). Safe to call multiple times. */
+        xSemaphoreGive(ble_connect_sem);
+    }
     publish_status();
     ESP_LOGI(TAG, "HTTP BLE %s", enable ? "enable" : "disable");
     return true;
@@ -490,6 +450,8 @@ static void mqtt_init(void) {
         .credentials.username = g_cfg.mqtt_user,
         .credentials.authentication.password = g_cfg.mqtt_pass,
         .credentials.client_id = client_id,
+        .buffer.out_size = 512,
+        .task.stack_size = 3072,
     };
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
@@ -507,62 +469,77 @@ static void mqtt_init(void) {}
 #endif
 
 // ============================================================
-// WiFi STA
+// ============================================================
+// System Manager — event-driven startup state machine
 // ============================================================
 
-static EventGroupHandle_t wifi_event_group = NULL;
 static int wifi_retry_count = 0;
-#define WIFI_CONNECTED_BIT BIT0
+#define SYS_EVT_WIFI_READY   BIT0
+#define SYS_EVT_BLE_READY    BIT1
 
+static EventGroupHandle_t sys_events;  // system-level event flags
+
+/* Stages of the system startup lifecycle */
+enum sys_stage {
+    STAGE_IDLE,
+    STAGE_WIFI,
+    STAGE_HTTP,
+    STAGE_BLE,
+    STAGE_MQTT,
+    STAGE_RUNNING,
+};
+static enum sys_stage _stage = STAGE_IDLE;
+
+static const char *stage_name(enum sys_stage s) {
+    switch (s) {
+        case STAGE_IDLE:    return "IDLE";
+        case STAGE_WIFI:    return "WIFI";
+        case STAGE_HTTP:    return "HTTP";
+        case STAGE_BLE:     return "BLE";
+        case STAGE_MQTT:    return "MQTT";
+        case STAGE_RUNNING: return "RUNNING";
+        default:            return "?";
+    }
+}
+
+static void advance_stage(void) {
+    ESP_LOGI(TAG, "=== Stage: %s → %s ===",
+             stage_name(_stage), stage_name(_stage + 1));
+    _stage++;
+}
+
+/* WiFi Manager — pure event passing, no blocking in callbacks */
 static void wifi_event_handler(void* arg, esp_event_base_t base, int32_t id, void* data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (wifi_retry_count < 100) wifi_retry_count++;
-        int delay_ms = (wifi_retry_count < 5) ? (1000 * (1 << wifi_retry_count)) : 30000;
-        ESP_LOGW(TAG, "WiFi disconnected, retry in %dms (attempt %d)", delay_ms, wifi_retry_count);
-        vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        esp_wifi_connect();
+        wifi_retry_count++;
+        ESP_LOGW(TAG, "WiFi disconnected (reason=%d), retry (attempt %d)",
+                 ((wifi_event_sta_disconnected_t*)data)->reason, wifi_retry_count);
+        xEventGroupClearBits(sys_events, SYS_EVT_WIFI_READY);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         wifi_retry_count = 0;
         ip_event_got_ip_t* event = (ip_event_got_ip_t*)data;
         ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupSetBits(sys_events, SYS_EVT_WIFI_READY);
     }
 }
 
-static void wifi_init(void) {
-    wifi_event_group = xEventGroupCreate();
-
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    esp_event_handler_instance_t any_id;
-    esp_event_handler_instance_t got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                    &wifi_event_handler, NULL, &any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                    &wifi_event_handler, NULL, &got_ip));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = "",
-            .password = "",
-        },
-    };
-    strncpy((char*)wifi_config.sta.ssid, g_cfg.wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char*)wifi_config.sta.password, g_cfg.wifi_pass, sizeof(wifi_config.sta.password) - 1);
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi connecting to %s...", g_cfg.wifi_ssid);
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdTRUE,
-                         pdMS_TO_TICKS(20000));
+/* Dedicated reconnect task — never blocks the Event Loop */
+static void wifi_reconnect_task(void *arg) {
+    while (1) {
+        /* Wait for disconnect with both bits cleared */
+        xEventGroupWaitBits(sys_events, SYS_EVT_WIFI_READY,
+                            pdFALSE, pdFALSE, portMAX_DELAY);
+        vTaskDelay(pdMS_TO_TICKS(100));  /* debounce */
+        /* WIFI_READY is clear → we are disconnected → reconnect */
+        if (!(xEventGroupGetBits(sys_events) & SYS_EVT_WIFI_READY)) {
+            int d = (wifi_retry_count < 5) ? (1000 * (1 << wifi_retry_count)) : 30000;
+            if (d > 30000) d = 30000;
+            vTaskDelay(pdMS_TO_TICKS(d));
+            esp_wifi_connect();
+        }
+    }
 }
 
 // ============================================================
@@ -585,6 +562,19 @@ static void on_ble_state_change(BLEState old_state, BLEState new_state) {
 
 static void ble_task(void *pvParameters) {
     ESP_LOGI(TAG, "BLE task started");
+
+    /* Delayed BLE connection: wait up to BLE_CONNECT_DELAY_S for the
+       semaphore, or until the frontend user clicks "连接设备" to give
+       the semaphore early. This lets WiFi settle and avoids BLE radio
+       contention during initial page loads / image transfers. */
+    if (ble_connect_sem) {
+        TickType_t timeout = pdMS_TO_TICKS(BLE_CONNECT_DELAY_S * 1000);
+        if (xSemaphoreTake(ble_connect_sem, timeout) == pdTRUE) {
+            ESP_LOGI(TAG, "BLE connect triggered early by frontend");
+        } else {
+            ESP_LOGI(TAG, "BLE connect delay expired (%ds), starting now", BLE_CONNECT_DELAY_S);
+        }
+    }
 
     ble_manager_set_state_callback(on_ble_state_change);
     ble_manager_set_port_data_callback(NULL);
@@ -658,6 +648,11 @@ static void ble_task(void *pvParameters) {
                         ESP_LOGI(TAG, "CMD_PORT: SET16=0x%02lX sent", (unsigned long)current);
                     } else {
                         ESP_LOGW(TAG, "CMD_PORT: SET16=0x%02lX FAILED", (unsigned long)current);
+                        if (!ble_manager_is_ready()) {
+                            ESP_LOGW(TAG, "BLE not connected, aborting port control");
+                            cmd.type = CMD_NOP;  // exit command drain loop
+                            break;
+                        }
                     }
                     res = (BleResult){RES_SET, true, 16, current, 0};
                     xQueueSend(result_queue, &res, 0);
@@ -686,6 +681,28 @@ static void ble_task(void *pvParameters) {
             }
         }
 
+        // Auto BLE reconnect with exponential backoff:
+        //  1st retry after 10s, then 20s, 40s, 80s, ... capped at 300s.
+        //  Resets to 10s when BLE reconnects successfully.
+        {
+            static uint64_t last_ble_connected = 0;
+            static unsigned backoff_sec = 10;
+            uint64_t now = esp_timer_get_time() / 1000;
+            bool ready = ble_manager_is_ready();
+            if (ready) {
+                last_ble_connected = now;
+                backoff_sec = 10;  // reset on success
+            } else if (ble_enabled && last_ble_connected > 0 &&
+                       (now - last_ble_connected >= (uint64_t)backoff_sec * 1000)) {
+                ESP_LOGI(TAG, "BLE auto-reconnect: restarting scanner (backoff=%us)...", backoff_sec);
+                last_ble_connected = now;
+                backoff_sec = (backoff_sec >= 150) ? 300 : (backoff_sec * 2);
+                ble_manager_set_enabled(false);
+                vTaskDelay(pdMS_TO_TICKS(100));  // brief settle
+                ble_manager_set_enabled(true);
+            }
+        }
+
         // Only yield if truly idle
         if (!did_work) vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -697,28 +714,64 @@ static void ble_task(void *pvParameters) {
 
 static void app_task(void* pvParameters) {
     vTaskDelay(pdMS_TO_TICKS(100));
+    uint64_t last_mem_print = 0;
     uint64_t last_status_print = 0;
-    uint64_t last_cd_fetch = 0;
+    uint64_t last_cd_fetch_slow = 0;
+    uint64_t last_cd_fetch_fast = 0;
     uint64_t last_mqtt_restart = 0;
     int mqtt_restart_count = 0;
 
     while (1) {
         uint64_t now = esp_timer_get_time() / 1000;
 
-#if ENABLE_MQTT
-        // MQTT health check with exponential backoff
-        if (now - last_mqtt_ok > 60000 && last_mqtt_ok > 0) {
-            uint32_t interval = (mqtt_restart_count < 3) ? 60 : (mqtt_restart_count < 6) ? 300 : 600;
-            if (now - last_mqtt_restart >= interval) {
-                ESP_LOGW(TAG, "MQTT no activity %lus, restarting (attempt %d)...", (unsigned long)(now - last_mqtt_ok) / 1000, mqtt_restart_count + 1);
-                esp_mqtt_client_stop(mqtt_client);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                esp_mqtt_client_start(mqtt_client);
-                last_mqtt_restart = now;
-                mqtt_restart_count++;
+        // Memory monitor + GC every 10 seconds
+        if (now - last_mem_print >= 10000) {
+            last_mem_print = now;
+            size_t _free = esp_get_free_heap_size();
+            size_t _largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            ESP_LOGI(TAG, "MEM: free=%u min=%u max_block=%u",
+                     (unsigned)_free,
+                     (unsigned)esp_get_minimum_free_heap_size(),
+                     (unsigned)_largest);
+            if (_largest < _free / 2) {
+                ESP_LOGW(TAG, "Fragmentation: max_block=%u < free/2 (%u) — triggering GC",
+                         (unsigned)_largest, (unsigned)_free / 2);
+                /* Active GC: reset cJSON pool, log detailed caps breakdown */
+                size_t pool_peak = http_server_pool_gc();
+                multi_heap_info_t info;
+                heap_caps_get_info(&info, MALLOC_CAP_8BIT);
+                ESP_LOGI(TAG, "GC: pool_peak=%u caps_8bit: free=%u min_free=%u largest=%u total_alloc=%u",
+                         (unsigned)pool_peak,
+                         (unsigned)info.total_free_bytes,
+                         (unsigned)info.minimum_free_bytes,
+                         (unsigned)info.largest_free_block,
+                         (unsigned)info.total_allocated_bytes);
             }
         }
-        if (now - last_mqtt_ok < 60000) mqtt_restart_count = 0;
+
+#if ENABLE_MQTT
+        // MQTT reconnection watchdog: if disconnected >2min since last
+        // successful publish, try reconnecting. After 3 failed attempts,
+        // force WiFi reset to purge corrupted LWIP state (the "Host is
+        // unreachable" case where WiFi is associated but TCP stack is dead).
+        if (mqtt_client && !mqtt_connected &&
+            last_mqtt_ok > 0 &&
+            (now - last_mqtt_ok > 120000) &&
+            (now - last_mqtt_restart >= 30000)) {
+            last_mqtt_restart = now;
+            mqtt_restart_count++;
+            if (mqtt_restart_count > 3) {
+                ESP_LOGW(TAG, "MQTT reconnect failed 3x, forcing WiFi reset");
+                mqtt_restart_count = 0;
+                esp_wifi_disconnect();
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                esp_wifi_connect();
+            } else {
+                ESP_LOGI(TAG, "MQTT disconnected %ds, reconnecting (%d/3)",
+                         (int)((now - last_mqtt_ok) / 1000), mqtt_restart_count);
+                esp_mqtt_client_reconnect(mqtt_client);
+            }
+        }
 #endif
 
         // Process BLE results
@@ -755,14 +808,24 @@ static void app_task(void* pvParameters) {
                         int bit = (idx == 0) ? 0 : 8;
                         pd_on = (protocol_extend_val >> bit) & 1;
                     }
-                    uint8_t proto = estimate_protocol(res.piid, v, code, 0, pd_on);
+                    // Extract hardware protocol code from PIID 17/18 if available
+                    uint8_t hw_proto = 0;
+                    if (settings_valid[17] || settings_valid[18]) {
+                        switch (res.piid) {
+                            case 1: if (settings_valid[17]) hw_proto = (settings[17] >> 24) & 0xFF; break;
+                            case 2: if (settings_valid[17]) hw_proto = (settings[17] >> 8) & 0xFF; break;
+                            case 3: if (settings_valid[18]) hw_proto = (settings[18] >> 24) & 0xFF; break;
+                            case 4: if (settings_valid[18]) hw_proto = (settings[18] >> 8) & 0xFF; break;
+                        }
+                    }
+                    uint8_t proto = estimate_protocol(res.piid, v, code, 0, pd_on, hw_proto);
                     bool was_active = port_data[idx].active;
                     // Debounce: skip zero-value GET if port was previously active
-                    // and we're within 2s of a non-port-control SET (protocol transitions).
+                    // and we're within 500ms of a non-port-control SET (protocol transitions).
                     uint64_t now = esp_timer_get_time() / 1000;
                     bool nearly_zero = (v < 0.1f && c < 0.1f && st == 0);
                     if (nearly_zero && port_data[idx].valid && port_data[idx].active && last_set_piid != 16) {
-                        if (now - last_set_time < 2000) {
+                        if (now - last_set_time < 500) {
                             UNLOCK_STATE();
                             break;
                         }
@@ -771,7 +834,7 @@ static void app_task(void* pvParameters) {
                     bool publish = false;
                     if (was_active != port_data[idx].active) publish = true;
                     if (!port_data[idx].valid) publish = true;
-                    if (now - last_set_time < 2000 && (last_set_piid == 16 || last_set_piid == 21)) {
+                    if (now - last_set_time < 500 && (last_set_piid == 16 || last_set_piid == 21)) {
                         publish = true;
                     }
                     UNLOCK_STATE();
@@ -832,11 +895,12 @@ static void app_task(void* pvParameters) {
                 // Always update Bemfa BLE state regardless of main MQTT
                 bemfa_publish_status(res.value != 0);
                 if (res.value) {
-                    // BLE connected — fetch key settings from device
-                    // Only GET essential PIIDs to avoid 120s+ blocking
-                    static const uint8_t READABLE_PIIDS[] = {6, 16, 21};
-                    for (int i = 0; i < sizeof(READABLE_PIIDS); i++) {
-                        BleCommand c = {CMD_GET, READABLE_PIIDS[i], 0, 0};
+                    // Fetch settings on initial BLE connect so frontend shows
+                    // actual values instead of hardcoded defaults, and protocol
+                    // detection uses real hardware protocol codes (PIID 17/18).
+                    static const uint8_t INIT_PIIDS[] = {5, 6, 15, 21, 17, 18};
+                    for (int i = 0; i < sizeof(INIT_PIIDS); i++) {
+                        BleCommand c = {CMD_GET, INIT_PIIDS[i], 0, 0};
                         xQueueSend(cmd_queue, &c, 0);
                     }
                 }
@@ -846,12 +910,21 @@ static void app_task(void* pvParameters) {
             }
         }
 
-        // Periodically GET countdown values (PIID 9-12) + port control (PIID 16)
-        if (ble_ready_flag && (now - last_cd_fetch >= 30000)) {
-            last_cd_fetch = now;
-            static const uint8_t CD_PIIDS[] = {9, 10, 11, 12, 16};
-            for (int i = 0; i < sizeof(CD_PIIDS); i++) {
-                BleCommand c = {CMD_GET, CD_PIIDS[i], 0, 0};
+        // Slow poll (90s): scene mode, screen time, countdown, trickle
+        if (ble_ready_flag && (now - last_cd_fetch_slow >= 90000)) {
+            last_cd_fetch_slow = now;
+            static const uint8_t SLOW_PIIDS[] = {5, 6, 9, 10, 11, 12, 15};
+            for (int i = 0; i < sizeof(SLOW_PIIDS); i++) {
+                BleCommand c = {CMD_GET, SLOW_PIIDS[i], 0, 0};
+                xQueueSend(cmd_queue, &c, 0);
+            }
+        }
+        // Fast poll (20s): port control (16) and protocol extends (21) change via SET
+        if (ble_ready_flag && (now - last_cd_fetch_fast >= 20000)) {
+            last_cd_fetch_fast = now;
+            static const uint8_t FAST_PIIDS[] = {16, 21};
+            for (int i = 0; i < sizeof(FAST_PIIDS); i++) {
+                BleCommand c = {CMD_GET, FAST_PIIDS[i], 0, 0};
                 xQueueSend(cmd_queue, &c, 0);
             }
         }
@@ -886,17 +959,21 @@ static void ap_reboot_callback(void) {
     xTaskCreate(_reboot_task, "reboot", 2048, NULL, 1, NULL);
 }
 
-static void enter_ap_mode(void) {
+static void enter_ap_mode(bool net_init_done) {
     ESP_LOGW(TAG, "No config found — entering AP mode for setup");
     ESP_LOGW(TAG, "Connect to WiFi: %s  Password: %s", AP_SSID, AP_PASSWORD);
     ESP_LOGW(TAG, "Then open: http://192.168.4.1/");
 
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    if (!net_init_done) {
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_ap();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    } else {
+        // WiFi already initialized by system_manager — just create AP netif
+        esp_netif_create_default_wifi_ap();
+    }
 
     wifi_config_t ap_config = {
         .ap = {
@@ -910,6 +987,9 @@ static void enter_ap_mode(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    /* Must be called after wifi_start */
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_ERROR_CHECK(esp_wifi_set_inactive_time(WIFI_IF_AP, 600));
 
     ESP_LOGI(TAG, "AP started");
 
@@ -918,6 +998,98 @@ static void enter_ap_mode(void) {
 
     // Block forever — HTTP callback will reboot
     while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+// ============================================================
+// System Manager — startup coordinator
+// ============================================================
+
+static void system_manager(void) {
+    sys_events = xEventGroupCreate();
+
+    /* ---- Stage: WiFi ---- */
+    advance_stage(); // STAGE_WIFI
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
+
+    esp_event_handler_instance_t e_any, e_gotip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                    &wifi_event_handler, NULL, &e_any));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                    &wifi_event_handler, NULL, &e_gotip));
+
+    wifi_config_t wifi_sta = {
+        .sta = {.ssid = "", .password = ""},
+    };
+    strncpy((char*)wifi_sta.sta.ssid, g_cfg.wifi_ssid, sizeof(wifi_sta.sta.ssid)-1);
+    strncpy((char*)wifi_sta.sta.password, g_cfg.wifi_pass, sizeof(wifi_sta.sta.password)-1);
+    ESP_LOGI(TAG, "WiFi SSID='%s' (len=%d) PASS len=%d",
+             g_cfg.wifi_ssid, strlen(g_cfg.wifi_ssid), strlen(g_cfg.wifi_pass));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_sta));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    /* Coexistence: balance BLE and WiFi */
+    esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi connecting to %s...", g_cfg.wifi_ssid);
+    EventBits_t bits = xEventGroupWaitBits(sys_events, SYS_EVT_WIFI_READY,
+                                            pdFALSE, pdTRUE, pdMS_TO_TICKS(30000));
+    if (!(bits & SYS_EVT_WIFI_READY)) {
+        ESP_LOGW(TAG, "WiFi failed to connect within 30s — proceeding in AP mode");
+        enter_ap_mode(true);  // netif/event_loop already initialized
+        return;
+    }
+    /* Start reconnect task only AFTER first successful connection */
+    xTaskCreatePinnedToCore(wifi_reconnect_task, "wifi_reconn", 3072, NULL, 3, NULL, 0);
+
+    /* ---- Stage: HTTP ---- */
+    advance_stage(); // STAGE_HTTP
+    _init_topics();
+    _init_settings_defaults();
+    ble_manager_store_setting(16, port_ctrl_val);
+    ble_manager_store_setting(21, protocol_extend_val);
+
+    cmd_queue = xQueueCreate(20, sizeof(BleCommand));
+    urgent_queue = xQueueCreate(4, sizeof(BleCommand));
+    result_queue = xQueueCreate(48, sizeof(BleResult));
+    state_mutex = xSemaphoreCreateMutex();
+
+    http_server_set_callbacks(get_port_data_json, get_settings_json,
+                              handle_port_control, handle_setting_set,
+                              handle_protocol_toggle,
+                              handle_ble_control);
+    http_server_start(&g_cfg, ap_reboot_callback);
+    ESP_LOGI(TAG, "HTTP server ready");
+
+    /* Create semaphore for delayed BLE connection. ble_task will wait
+       on this semaphore; handle_ble_control can give it to wake up early. */
+    ble_connect_sem = xSemaphoreCreateBinary();
+
+    /* ---- Stage: BLE ---- */
+    advance_stage(); // STAGE_BLE
+#if CONFIG_FREERTOS_UNICORE
+    /* Single-core (ESP32-C3/H2): no core-1 to pin to */
+    xTaskCreate(ble_task, "ble", 16384, NULL, 2, NULL);
+#else
+    /* Dual-core (ESP32/S3): pin BLE to core 1 (NimBLE controller) */
+    xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
+#endif
+    xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
+
+    /* ---- Stage: MQTT + Bemfa ---- */
+    advance_stage(); // STAGE_MQTT
+    vTaskDelay(pdMS_TO_TICKS(2000));  // brief settle before MQTT dials out
+    mqtt_init();
+    bemfa_init(&g_cfg, handle_port_control, handle_ble_control);
+
+    advance_stage(); // STAGE_RUNNING
+    ESP_LOGI(TAG, "System startup complete — all services running");
 }
 
 // ============================================================
@@ -931,55 +1103,12 @@ void app_main(void) {
 
     // NVS init
     config_store_init();
-
-    // Load config from NVS
     config_store_load(&g_cfg);
 
-    // First-time setup: no saved config → AP mode
     if (!g_cfg.valid) {
-        enter_ap_mode();
-        return; // never reached
+        enter_ap_mode(false);  // first boot — init netif/event_loop
+        return;
     }
 
-    // WiFi
-    wifi_init();
-    _init_topics();
-    _init_settings_defaults();
-    // Sync PIID 16/21 to ble_manager for protocol detection
-    ble_manager_store_setting(16, port_ctrl_val);
-    ble_manager_store_setting(21, protocol_extend_val);
-
-    // OTA
-    ota_update_init();
-
-    // HTTP server (for config, OTA & dashboard)
-    http_server_set_callbacks(get_port_data_json, get_settings_json,
-                              handle_port_control, handle_setting_set,
-                              handle_protocol_toggle,
-                              handle_ble_control);
-    http_server_start(&g_cfg, ap_reboot_callback);
-    ESP_LOGI(TAG, "HTTP server ready");
-
-    // MQTT
-    mqtt_init();
-
-    // Create queues
-    cmd_queue = xQueueCreate(20, sizeof(BleCommand));
-    urgent_queue = xQueueCreate(4, sizeof(BleCommand));
-    result_queue = xQueueCreate(32, sizeof(BleResult));
-    state_mutex = xSemaphoreCreateMutex();
-
-    // Bemfa (小爱同学) — after queues and MQTT are ready
-    bemfa_init(&g_cfg, handle_port_control, handle_ble_control);
-
-    // Start tasks
-    // C3 is single-core, use un-pinned tasks.
-    // ESP32 / S3: pin BLE to core 1, app to core 0 for better cache isolation.
-#if CONFIG_IDF_TARGET_ESP32C3
-    xTaskCreate(ble_task, "ble", 16384, NULL, 2, NULL);
-    xTaskCreate(app_task,  "app", 8192,  NULL, 1, NULL);
-#else
-    xTaskCreatePinnedToCore(ble_task, "ble", 16384, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(app_task,  "app", 8192,  NULL, 1, NULL, 0);
-#endif
+    system_manager();
 }

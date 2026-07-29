@@ -1,5 +1,49 @@
 # ESP32 BLE 固件发布说明
 
+## v1.1.0
+
+### 新增
+- **前端嵌入**: 完全重构前端页面，复刻米家页面，全部前端资源（HTML/CSS/JS/图片）嵌入固件，无需外部服务器或 SPIFFS
+- **OTA**: 移除OTA功能，app 分区扩至 3.875MB，4% 空闲 → 26% 空闲
+- **BLE 延时连接**: 启动后延迟 60 秒再发起 BLE 连接，确保 HTTP 服务与前端资源加载优先完成，前端也可手动提前触发连接
+- **配置脱敏**: 敏感字段（WiFi 密码、设备密钥、MQTT 密码等）API 返回时自动脱敏，保存时跳过 `****`
+- **BLE 自动重连**: 断连后自动重启扫描器，指数退避（10s → 20s → 40s → 80s → 160s → 300s 封顶）
+- **AP 模式优化**: 连接WiFi失败自动进入AP模式，关闭 Modem 省电（`WIFI_PS_NONE`）+ station 不活跃超时 10 分钟
+- **`flash.py` 跨版本兼容**: 自动探测 esptool 参数格式（连字符/下划线），适配 CI 与本地环境
+
+### 优化
+- **协议检测**: 硬件协议码（PIID 17/18）优先，PDO kind + PPS 开关完整检查链
+- **WiFi/BLE 共存**: 大文件传输时动态切换 `ESP_COEX_PREFER_WIFI`，发送完恢复 BALANCE
+- **内存优化**: NimBLE 缓冲区池裁剪（约节省 17KB），TCP 发送缓冲 8192，MQTT 任务栈 4096
+- **大文件分块传输**: 4096 字节分块 + 指数退避重试（最大 8 次，1.27s），抑制 EAGAIN 断连
+- **HTTP 超时**: `send_wait_timeout` 5s → 10s，撑过 BLE 繁忙期
+- **端口去抖动**: 500ms（原 2000ms），减少断开检测延迟
+- **通知队列**: `NOTIF_QUEUE_LEN` 8 → 16，降低推送溢出风险
+- **result_queue**: 32 → 48，xQueueSend 增加 50ms 超时 + 丢弃日志
+- **NimBLE 内存参数回调**: `ACL_BUF_SIZE` 128→255，`HCI_EVT_BUF_SIZE` 128→256 等，确保服务发现正常
+- **HTML gzip**: phone.html 80% 压缩，config.html 76% 压缩
+
+### 修复
+- **C3 BLE 绑核崩溃**: `xTaskCreatePinnedToCore` 绑 Core 1 导致 assert，改为 `CONFIG_FREERTOS_UNICORE` 条件编译
+- **WiFi 密码保存后连不上**: `strncpy` 满长度缺 `\0` 导致 NVS 存脏数据，所有 `SET_STR` 强制 null 终止
+- **配置有效标记只检查 SSID**: `_cfg->valid` 补充密码非空判断
+- **密码末尾空格未被剔除**: config.html JS 中 `wifi_pass`/`mqtt_pass` 缺少 `.trim()`
+- **CMD_PORT 死循环重试**: BLE 断开后仍在发 SET16，失败时检测 BLE 状态并终止命令循环
+- **merge-bin CMake 冲突**: `add_custom_target` 双 configure 重复注册，加 `if(NOT TARGET)` 保护
+- **Interrupt WDT 超时崩溃**: C3 单核 BLE GATT 并发时关中断超限，IWDT 300ms → 1000ms
+- **Task WDT 误触发**: C3 单核 WiFi/BLE 共享 CPU，TWDT 5s → 30s
+
+### 构建
+- ESP-IDF v5.3.5
+- NimBLE Central
+- ESP-MQTT + cJSON + mbedTLS
+
+### 已知限制
+- **C3 单核射频竞争**：ESP32-C3 为单核芯片，WiFi 与 BLE 共享同一射频前端。BLE 数据频繁交互时可能导致 WiFi TCP 发送超时、MQTT 短暂断连，系统通常能在 30-60 秒内自动恢复，但极端场景下可能出现更长的通信中断。
+- **内存碎片化**：ESP32 可用堆约 320KB，C3 可用堆约 240KB，长时间运行后碎片化可能导致最大连续块降至 9-15KB。当前通过 LWIP 独立堆、cJSON 池化、定期 GC 缓解，实际运行中尚未触发致命问题，但建议避免频繁的全量 API 轮询和静态资源加载。
+- **协议检测**：基于电压曲线与特征码的启发式推断，仅供参考以米家显示为准。
+- **实机测试**：ESP32 / ESP32-C3 固件经过实机测试与调优，ESP32-S3 尚未进行专项测试和优化，使用该固件时请注意，建议自行按需编译调整。
+
 ## v1.0.3
 
 ### 新增

@@ -1,4 +1,5 @@
 #include "bemfa.h"
+#include "config_store.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_http_client.h"
@@ -23,7 +24,7 @@ static bool _circuit_open = false;
 static uint64_t _circuit_open_time = 0;
 #define MAX_CONNECT_FAILS 5
 #define CIRCUIT_RESET_SEC 300
-static const DeviceConfig *_cfg = NULL;
+static DeviceConfig *_cfg = NULL;
 
 // Ping/pong keepalive (aligned with HA integration)
 #define TOPIC_PING          "hassping"
@@ -52,19 +53,25 @@ static const char *MD5_HEX[NUM_DEVICES] = {
     "2fc0d9b7387e677f287fbdba07f2877a",  // md5("cuktech_ble")
 };
 
-static const char *DEVICE_NAMES[NUM_DEVICES] = {
-    "C口1开关", "C口2开关", "C口3开关", "USB-A开关", "蓝牙开关",
-};
+/* Get custom display name from config for each device index */
+static const char *_device_name(int idx) {
+    if (!_cfg) return "";
+    switch (idx) {
+        case 0: return _cfg->bemfa_name_c1;
+        case 1: return _cfg->bemfa_name_c2;
+        case 2: return _cfg->bemfa_name_c3;
+        case 3: return _cfg->bemfa_name_a;
+        case 4: return _cfg->bemfa_name_ble;
+        default: return "";
+    }
+}
 static const char *PORT_NAMES[NUM_DEVICES] = {"c1", "c2", "c3", "a", "ble"};
 
 // ---- HTTP API ----
 
-static bool _register_topic(const char *uid, const char *topic, const char *name) {
-    char post_data[256];
-    snprintf(post_data, sizeof(post_data),
-             "uid=%s&topic=%s&type=1&name=%s", uid, topic, name);
+static bool _http_post(const char *url, const char *post_data) {
     esp_http_client_config_t http_cfg = {
-        .url = "http://api.bemfa.com/api/user/addtopic/",
+        .url = url,
         .method = HTTP_METHOD_POST,
         .timeout_ms = 5000,
     };
@@ -72,7 +79,7 @@ static bool _register_topic(const char *uid, const char *topic, const char *name
     esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
     esp_err_t err = esp_http_client_open(client, strlen(post_data));
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HTTP open failed for %s: %s", topic, esp_err_to_name(err));
+        ESP_LOGW(TAG, "HTTP open failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
         return false;
     }
@@ -80,11 +87,23 @@ static bool _register_topic(const char *uid, const char *topic, const char *name
     int status = esp_http_client_fetch_headers(client);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    ESP_LOGI(TAG, "Register topic %s (%s): HTTP %d", topic, name, status);
-    if (status != 200) {
-        ESP_LOGW(TAG, "Failed to register topic %s (HTTP %d)", topic, status);
-    }
     return status == 200;
+}
+
+static bool _register_topic(const char *uid, const char *topic, const char *name) {
+    char post_data[256];
+    snprintf(post_data, sizeof(post_data),
+             "uid=%s&topic=%s&type=1&name=%s", uid, topic, name);
+    ESP_LOGI(TAG, "Register topic %s (%s)", topic, name);
+    return _http_post("http://api.bemfa.com/api/user/addtopic/", post_data);
+}
+
+static bool _delete_topic(const char *uid, const char *topic) {
+    char post_data[128];
+    snprintf(post_data, sizeof(post_data),
+             "uid=%s&topic=%s&type=1", uid, topic);
+    ESP_LOGI(TAG, "Delete topic %s", topic);
+    return _http_post("http://api.bemfa.com/api/user/deltopic/", post_data);
 }
 
 // Pre-resolve DNS for Bemfa API to ensure network is ready
@@ -116,12 +135,24 @@ static void _register_task(void *arg) {
         }
     }
 
-    ESP_LOGI(TAG, "Registering Bemfa topics...");
+    ESP_LOGI(TAG, "Registering Bemfa topics... (modified=%d)", _cfg->bemfa_modified);
     for (int i = 0; i < NUM_DEVICES; i++) {
-        _register_topic(_cfg->bemfa_uid, _topics[i], DEVICE_NAMES[i]);
+        /* If names changed, delete old topic first so the new name takes effect */
+        if (_cfg->bemfa_modified) {
+            _delete_topic(_cfg->bemfa_uid, _topics[i]);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        _register_topic(_cfg->bemfa_uid, _topics[i], _device_name(i));
         vTaskDelay(pdMS_TO_TICKS(100));
     }
     ESP_LOGI(TAG, "Bemfa topic registration done");
+
+    if (_cfg->bemfa_modified) {
+        _cfg->bemfa_modified = false;
+        config_store_save(_cfg);
+        ESP_LOGI(TAG, "Bemfa modified flag cleared");
+    }
+
     vTaskDelete(NULL);
 }
 
@@ -252,7 +283,7 @@ static void _mqtt_event_handler(void *arg, esp_event_base_t base, int32_t id, vo
 
 // ---- Init / Deinit ----
 
-void bemfa_init(const DeviceConfig *cfg, bemfa_cmd_cb on_cmd, bemfa_ble_cb on_ble) {
+void bemfa_init(DeviceConfig *cfg, bemfa_cmd_cb on_cmd, bemfa_ble_cb on_ble) {
     if (!cfg->bemfa_enable || cfg->bemfa_uid[0] == '\0') {
         ESP_LOGI(TAG, "Bemfa disabled");
         return;
