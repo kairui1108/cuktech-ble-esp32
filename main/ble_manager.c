@@ -14,6 +14,7 @@
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "esp_timer.h"
 
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
@@ -63,13 +64,19 @@ static uint8_t _seq = 1;
 static PortData _ports[4] = {};
 static uint32_t _settings[32] = {};
 static bool _settings_valid[32] = {};
+/* Spinlock protects _settings[] / _settings_valid[] from concurrent
+   access between ble_task (reads during _parse_port) and app_task
+   (writes via ble_manager_store_setting). */
+static portMUX_TYPE _settings_spinlock = portMUX_INITIALIZER_UNLOCKED;
+#define LOCK_SETTINGS()   portENTER_CRITICAL(&_settings_spinlock)
+#define UNLOCK_SETTINGS() portEXIT_CRITICAL(&_settings_spinlock)
 static uint32_t _ra = 0;
 static uint64_t _last_keepalive = 0;
 static SemaphoreHandle_t _disc_sem = NULL, _connected_sem = NULL, _disconnect_sem = NULL;
 static uint16_t _disc_service_start = 0, _disc_service_end = 0;
 static uint8_t _target_addr[6] = {}, _token[12] = {};
 static char _mac_str[18] = {};
-static bool _nimble_ready = false;
+static volatile bool _nimble_ready = false;  /* written by NimBLE host task, read by ble_task */
 static volatile bool _enabled = true;
 
 typedef struct { uint16_t uuid; uint16_t *handle; const char *name; } CharCtx;
@@ -288,21 +295,25 @@ static bool _wru(uint16_t handle, const uint8_t *data, size_t len) {
 // Hardware protocol code from PIID 17/18 (byte positions aligned with Python ble_manager.py):
 // PIID 17: byte[3] = C1, byte[1] = C2; PIID 18: byte[3] = C3, byte[1] = A
 static uint8_t _get_hw_proto(uint8_t piid) {
+    LOCK_SETTINGS();
+    uint8_t result = 0;
     switch (piid) {
-        case 1: return (_settings_valid[17] && ((_settings[17] >> 24) & 0xFF) > 0)
-                       ? (_settings[17] >> 24) & 0xFF : 0;
-        case 2: return (_settings_valid[17] && ((_settings[17] >> 8) & 0xFF) > 0)
-                       ? (_settings[17] >> 8) & 0xFF : 0;
-        case 3: return (_settings_valid[18] && ((_settings[18] >> 24) & 0xFF) > 0)
-                       ? (_settings[18] >> 24) & 0xFF : 0;
-        case 4: return (_settings_valid[18] && ((_settings[18] >> 8) & 0xFF) > 0)
-                       ? (_settings[18] >> 8) & 0xFF : 0;
-        default: return 0;
+        case 1: result = (_settings_valid[17] && ((_settings[17] >> 24) & 0xFF) > 0)
+                       ? (_settings[17] >> 24) & 0xFF : 0; break;
+        case 2: result = (_settings_valid[17] && ((_settings[17] >> 8) & 0xFF) > 0)
+                       ? (_settings[17] >> 8) & 0xFF : 0; break;
+        case 3: result = (_settings_valid[18] && ((_settings[18] >> 24) & 0xFF) > 0)
+                       ? (_settings[18] >> 24) & 0xFF : 0; break;
+        case 4: result = (_settings_valid[18] && ((_settings[18] >> 8) & 0xFF) > 0)
+                       ? (_settings[18] >> 8) & 0xFF : 0; break;
     }
+    UNLOCK_SETTINGS();
+    return result;
 }
 
 static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code, uint8_t hw_protocol) {
     if (hw_protocol > 0) return hw_protocol;
+    LOCK_SETTINGS();
     int pd_bit = (piid == 1) ? 0 : 8;
     int pps_bit = (piid == 1) ? 1 : 9;
     bool pd_enabled = (_settings_valid[21]) ? ((_settings[21] >> pd_bit) & 1) : true;
@@ -311,7 +322,12 @@ static uint8_t _estimate_proto(uint8_t piid, float voltage, uint8_t code, uint8_
     if ((piid == 1 || piid == 2) && _settings_valid[17]) {
         uint16_t port_word = (piid == 1) ? (_settings[17] & 0xFFFF) : ((_settings[17] >> 16) & 0xFFFF);
         pdo_kind = (port_word >> 8) & 0xFF;
+    } else if ((piid == 3 || piid == 4) && _settings_valid[18]) {
+        /* C3 (piid=3) = lower 16 bits; A (piid=4) = upper 16 bits (same layout as PIID 17) */
+        uint16_t port_word = (piid == 3) ? (_settings[18] & 0xFFFF) : ((_settings[18] >> 16) & 0xFFFF);
+        pdo_kind = (port_word >> 8) & 0xFF;
     }
+    UNLOCK_SETTINGS();
     return estimate_protocol_shared(piid, voltage, code, pd_enabled, pps_enabled, pdo_kind, hw_protocol);
 }
 
@@ -832,12 +848,17 @@ static void _keepalive(void) {
 }
 
 void ble_manager_disconnect(void) {
+    /* Non-reentrant guard: prevent overlapping disconnect sequences */
+    static bool _disconnecting = false;
+    if (_disconnecting) { _drain_all_queues(); return; }
     if (!_connected) { _drain_all_queues(); return; }
+    _disconnecting = true;
     _disable_all_notifications();
     xSemaphoreTake(_disconnect_sem, 0);
     ble_gap_terminate(_conn_handle, 0x13);
     if (xSemaphoreTake(_disconnect_sem, pdMS_TO_TICKS(3000)) != pdTRUE) ESP_LOGW(TAG, "Disconnect timeout");
     _connected = false; _conn_handle = 0xFFFF; _drain_all_queues();
+    _disconnecting = false;
 }
 
 /* ============================================================
@@ -917,13 +938,16 @@ void ble_manager_init(const char *device_mac, const char *device_token, const ch
     bool mac_ok = (device_mac && strlen(device_mac) == 17 &&
                    sscanf(device_mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                           &mac[5], &mac[4], &mac[3], &mac[2], &mac[1], &mac[0]) == 6);
-    bool token_ok = (device_token && strlen(device_token) >= 1);
+    /* Token must be exactly 24 hex chars → 12 bytes.  We also accept
+       bare 12-byte raw token strings (rare config edge-case). */
+    size_t tlen = device_token ? strlen(device_token) : 0;
+    bool token_ok = (tlen >= 24);
 
     if (!mac_ok || !token_ok) {
-        ESP_LOGW(TAG, "BLE config incomplete (mac=%s token=%s len=%d) — BLE disabled",
+        ESP_LOGW(TAG, "BLE config incomplete (mac=%s token=%s len=%u) — BLE disabled",
                  device_mac ? "set" : "null",
-                 device_token ? (strlen(device_token) > 8 ? "set" : "short") : "null",
-                 device_token ? (int)strlen(device_token) : 0);
+                 device_token ? (tlen > 8 ? "set" : "short") : "null",
+                 (unsigned)tlen);
         _enabled = false;
         _state = BLE_IDLE;
         snprintf(_mac_str, sizeof(_mac_str), "%s", device_mac ? device_mac : "");
@@ -941,7 +965,12 @@ void ble_manager_init(const char *device_mac, const char *device_token, const ch
     _disconnect_sem = xSemaphoreCreateBinary();
 
     snprintf(_mac_str, sizeof(_mac_str), "%s", device_mac);
-    for (int i = 0; i < 12; i++) { char hex[3] = {device_token[i*2], device_token[i*2+1], 0}; _token[i] = (uint8_t)strtol(hex, NULL, 16); }
+    /* Parse 12-byte token from hex string. Loop guard ensures we never
+       read past the NUL terminator (already validated >= 24 chars). */
+    for (int i = 0; i < 12; i++) {
+        char hex[3] = {device_token[i*2], device_token[i*2+1], 0};
+        _token[i] = (uint8_t)strtol(hex, NULL, 16);
+    }
 
     ESP_LOGI(TAG, "Init NimBLE...");
     vTaskDelay(pdMS_TO_TICKS(500));
@@ -954,12 +983,31 @@ void ble_manager_init(const char *device_mac, const char *device_token, const ch
 
 BLEState ble_manager_state(void) { return _state; }
 bool ble_manager_is_ready(void) { return _state == BLE_READY; }
+bool ble_manager_is_idle(void) { return _state == BLE_IDLE; }
 void ble_manager_set_state_callback(StateCallback cb) { _state_cb = cb; }
 void ble_manager_set_port_data_callback(PortDataCallback cb) { _port_data_cb = cb; }
 const PortInfo* ble_manager_get_ports(void) { return (const PortInfo*)_ports; }
-uint32_t ble_manager_get_setting(uint8_t piid) { return (piid < 32) ? _settings[piid] : 0; }
-bool ble_manager_has_setting(uint8_t piid) { return piid < 32 && _settings_valid[piid]; }
-void ble_manager_store_setting(uint8_t piid, uint32_t val) { if (piid < 32) { _settings[piid] = val; _settings_valid[piid] = true; } }
+uint32_t ble_manager_get_setting(uint8_t piid) {
+    if (piid >= 32) return 0;
+    LOCK_SETTINGS();
+    uint32_t v = _settings[piid];
+    UNLOCK_SETTINGS();
+    return v;
+}
+bool ble_manager_has_setting(uint8_t piid) {
+    if (piid >= 32) return false;
+    LOCK_SETTINGS();
+    bool v = _settings_valid[piid];
+    UNLOCK_SETTINGS();
+    return v;
+}
+void ble_manager_store_setting(uint8_t piid, uint32_t val) {
+    if (piid < 32) {
+        LOCK_SETTINGS();
+        _settings[piid] = val; _settings_valid[piid] = true;
+        UNLOCK_SETTINGS();
+    }
+}
 
 int ble_manager_pending_count(void) {
     int count = 0;

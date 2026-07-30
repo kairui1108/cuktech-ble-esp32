@@ -659,7 +659,7 @@ void http_server_start(DeviceConfig *cfg, http_config_cb on_save) {
     config.max_open_sockets = 8;
     config.server_port = 80;
     config.max_resp_headers = 1024;  /* 4KB was overkill — 1KB covers all JSON responses */
-    config.stack_size = 8192;
+    config.stack_size = 6144;
     config.send_wait_timeout = 10;  /* seconds; default 5, increase for BLE coexistence */
 
     if (httpd_start(&_server, &config) != ESP_OK) {

@@ -26,6 +26,7 @@ void ble_manager_init(const char *device_mac, const char *device_token, const ch
 void ble_manager_loop(void);
 BLEState ble_manager_state(void);
 bool ble_manager_is_ready(void);
+bool ble_manager_is_idle(void);
 
 void ble_manager_set_state_callback(StateCallback cb);
 void ble_manager_set_port_data_callback(PortDataCallback cb);

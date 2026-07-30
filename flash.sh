@@ -147,8 +147,8 @@ case "$CMD" in
         _merge_bins
         read -r FLASH_MODE FLASH_SIZE <<< "$(_flash_params)"
         python -m esptool --chip "$TARGET" -p "$PORT" -b 460800 \
-            --before default-reset --after hard-reset \
-            write-flash --flash-mode "$FLASH_MODE" --flash-size "$FLASH_SIZE" \
+            --before default_reset --after hard_reset \
+            write_flash --flash_mode "$FLASH_MODE" --flash_size "$FLASH_SIZE" \
             0x0 build/firmware.bin
         echo "==> 烧录完成"
         ;;
@@ -167,8 +167,8 @@ case "$CMD" in
         _merge_bins
         read -r FLASH_MODE FLASH_SIZE <<< "$(_flash_params)"
         python -m esptool --chip "$TARGET" -p "$PORT" -b 460800 \
-            --before default-reset --after hard-reset \
-            write-flash --flash-mode "$FLASH_MODE" --flash-size "$FLASH_SIZE" \
+            --before default_reset --after hard_reset \
+            write_flash --flash_mode "$FLASH_MODE" --flash_size "$FLASH_SIZE" \
             0x0 build/firmware.bin
         echo "==> 启动串口监控 (Ctrl+] 退出)..."
         idf.py -p "$PORT" monitor

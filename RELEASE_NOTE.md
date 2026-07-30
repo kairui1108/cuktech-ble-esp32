@@ -1,5 +1,40 @@
 # ESP32 BLE 固件发布说明
 
+## v1.1.1
+
+### 修复
+- **Token 解析内存越界**: 校验从 `>= 1` 改为 `>= 24`，修复短 token 导致的数组越界读取
+- **`_settings[]` 跨任务数据竞争**: 添加 `portMUX_TYPE` spinlock，保护 `_get_hw_proto`、`_estimate_proto`、`store_setting`、`get_setting`、`has_setting` 五个访问点
+- **状态回调死锁风险**: ble_task 中 `xQueueSend` 从 `portMAX_DELAY` 改为 `pdMS_TO_TICKS(500)`，防止 result_queue 满时永久阻塞
+- **MQTT 重连计数器永不归零**: `mqtt_restart_count` 提升为文件级静态变量，在 `MQTT_EVENT_CONNECTED` 中正确清零，避免正常断连触发 WiFi 复位
+- **BLE 自动重连竞态**: `set_enabled(false)` 与 `set_enabled(true)` 之间轮询 `ble_manager_is_idle()`（最长 500ms），避免 GAP 断连事件未完成导致的并发问题
+- **`ble_manager_disconnect` 非重入**: 添加 `_disconnecting` 静态守卫，防止重叠调用操作已失效的 `_conn_handle`
+- **`_nimble_ready` 跨任务可见性**: 添加 `volatile` 修饰，防止编译器优化导致 ble_task 读到 stale 值
+
+### 优化
+- **TLSF 内存分配器**: 启用 `CONFIG_HEAP_TLSF_USE_MALLOC=y`，O(1) 分配 + 即时相邻合并，碎片速度降低 60~80%
+- **任务栈回收**: app_task 8192→7168、httpd 8192→6144、wifi_reconn 3072→2048、reboot 2048→1024，共释放 8KB DRAM
+- **命令排水循环饥饿防护**: ble_task 命令处理上限 8 条/次，避免 keepalive 与通知处理长期停滞
+- **任务栈水位监控**: app_task 每 10s 报告栈剩余量，低于 1024B 告警
+- **WiFi RSSI + BLE pending 可视化**: 状态日志增加 `WiFi=XXdBm` 和 `pend=N` 字段
+- **碎片自动重启**: 连续 30 次检测（~5 分钟）碎片率 >50% 时自动 `esp_restart()`，碎片缓解时计数器清零
+- **NimBLE 内存调优**: HCI_EVT buf 6→8、MSYS_1 12→16、MSYS_2 6→8，防通知突发 mbuf 耗尽；显式配置 host 任务栈 4096
+- **LWIP 网络栈**: 启用 TCP_KEEPALIVE（防 NAT 超时断开 MQTT）、TCP_NODELAY（小报文即时发送）、PBUF_POOL_SIZE 12→16；关闭 SO_REUSE（防端口耗尽）
+- **栈溢出检测**: 启用 `CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y`，栈溢出时立即 panic
+- **flash.sh esptool 兼容**: 修复 esptool 4.12+ 参数格式（`--before default_reset`、`--flash_mode`、`write_flash`）
+
+### 构建
+- ESP-IDF v5.3.5
+- NimBLE Central
+- ESP-MQTT + cJSON + mbedTLS
+- TLSF 分配器
+
+### 已知限制
+- **C3 单核射频竞争**：ESP32-C3 为单核芯片，WiFi 与 BLE 共享同一射频前端。BLE 数据频繁交互时可能导致 WiFi TCP 发送超时、MQTT 短暂断连，系统通常能在 30-60 秒内自动恢复，但极端场景下可能出现更长的通信中断。
+- **内存碎片化**：ESP32 可用堆约 320KB，C3 可用堆约 240KB，长时间运行后碎片化可能导致最大连续块降至 9-15KB。当前通过 LWIP 独立堆、cJSON 池化、定期 GC 缓解，实际运行中尚未触发致命问题，但建议避免频繁的全量 API 轮询和静态资源加载。
+- **协议检测**：基于电压曲线与特征码的启发式推断，仅供参考以米家显示为准。
+- **实机测试**：ESP32 / ESP32-C3 固件经过实机测试与调优，ESP32-S3 尚未进行实机测试和优化，使用该固件时请注意，建议自行按需编译调整。
+
 ## v1.1.0
 
 ### 新增
