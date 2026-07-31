@@ -26,8 +26,12 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
-# Increase Task WDT timeout for long BLE auth operations (dual-core, but BLE ops can block)
+# Task WDT: init + panic on timeout (detect/restart on task deadlock)
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=y
 
 # HTTP Server
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

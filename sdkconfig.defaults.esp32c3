@@ -30,6 +30,10 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_ESP_INT_WDT_TIMEOUT_MS=1000
 # Increase Task WDT timeout for C3 single-core (WiFi/BLE tasks share CPU0)
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+# Auto-init TWDT at startup and panic on timeout (catches soft deadlocks)
+CONFIG_ESP_TASK_WDT_INIT=y
+CONFIG_ESP_TASK_WDT_PANIC=y
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0=y
 
 # HTTP Server
 CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024

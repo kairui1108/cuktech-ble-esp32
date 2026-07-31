@@ -994,7 +994,7 @@ static void _reboot_task(void *arg) {
 
 static void ap_reboot_callback(void) {
     ESP_LOGI(TAG, "Config saved, scheduling reboot in 3s...");
-    xTaskCreate(_reboot_task, "reboot", 1024, NULL, 1, NULL);
+    xTaskCreate(_reboot_task, "reboot", 2048, NULL, 1, NULL);
 }
 
 static void enter_ap_mode(bool net_init_done) {
