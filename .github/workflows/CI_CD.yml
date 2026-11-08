@@ -119,9 +119,16 @@ jobs:
 
           BUILD_DIR="."
           [ -d esp32_ble/build ] && BUILD_DIR="esp32_ble"
-          # Keep the user-facing name firmware.bin; IDF names the merged
-          # image merged-binary.bin.
+          # Two images ship in every zip, because they are not interchangeable:
+          #   firmware.bin — merged flash image (bootloader @0x0, partition table
+          #     @0x8000, otadata @0xf000, app @0x20000), written from 0x0 by
+          #     flash.py.  IDF names it merged-binary.bin.
+          #   ota.bin      — bare application image (cuktech_ble.bin), the only
+          #     thing /api/ota accepts.  Uploading firmware.bin to /api/ota puts
+          #     the bootloader at the start of the OTA slot, and esp_ota_end()
+          #     rejects it as an application image (validate_failed).
           cp "${BUILD_DIR}/build/merged-binary.bin" "${DIST}/firmware.bin"
+          cp "${BUILD_DIR}/build/cuktech_ble.bin"    "${DIST}/ota.bin"
 
           # Determine flash params
           FLASH_MODE="dio"; FLASH_SIZE="4MB"
@@ -204,7 +211,13 @@ jobs:
             | **ESP32-S3** | `cuktech-ble-esp32s3.zip` |
             | **ESP32-C3** | `cuktech-ble-esp32c3.zip` |
 
-            每个 zip 包含: `firmware.bin`（完整烧录镜像）, `flash.py`
+            每个 zip 包含：
+
+            | 文件 | 用途 |
+            |---|---|
+            | `firmware.bin` | 整片镜像（bootloader + 分区表 + otadata + 应用），从 0x0 烧录 |
+            | `ota.bin` | 纯应用镜像，**仅用于 Web 界面 / HTTP OTA 升级** |
+            | `flash.py` | 串口整片烧录脚本 |
 
             ## 首次烧录
 
@@ -214,6 +227,13 @@ jobs:
             cd <target>/
             python flash.py
             ```
+
+            ## Web 界面 OTA 升级
+
+            打开设备 IP → 配置页 → 固件升级 → 选择解压出来的 **`ota.bin`**。
+
+            > 不要用 `firmware.bin` 做 OTA：它包含 bootloader，写入 OTA 槽后无法通过
+            > 应用镜像校验，会提示 `validate_failed` / 校验失败。
 
           files: |
             release/cuktech-ble-esp32.zip
