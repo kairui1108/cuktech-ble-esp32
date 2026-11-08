@@ -103,14 +103,13 @@ jobs:
           # is not committed to the upstream repo)
           python tools/generate_embedded.py
           idf.py build
-          # Merge bootloader+partition-table+app into single firmware.bin
-          BOOT_OFFSET="0x1000"
-          [ "${{ matrix.target }}" != "esp32" ] && BOOT_OFFSET="0x0"
-          python -m esptool --chip "${{ matrix.target }}" merge_bin \
-            -o build/firmware.bin \
-            "$BOOT_OFFSET" build/bootloader/bootloader.bin \
-            0x8000 build/partition_table/partition-table.bin \
-            0x10000 build/cuktech_ble.bin
+          # Merge with IDF's built-in action: the offsets come from
+          # build/flash_args, which is generated from partitions.csv
+          # (bootloader 0x0 / 0x1000, partition table 0x8000, otadata 0xf000,
+          # ota_0 0x20000).  The hand-written merge that used to live here
+          # still wrote the app at the old 0x10000 factory offset and omitted
+          # otadata, so every released image booted without finding the app.
+          idf.py merge-bin
 
       - name: Prepare artifacts and zip
         run: |
@@ -120,7 +119,9 @@ jobs:
 
           BUILD_DIR="."
           [ -d esp32_ble/build ] && BUILD_DIR="esp32_ble"
-          cp "${BUILD_DIR}/build/firmware.bin" "${DIST}/"
+          # Keep the user-facing name firmware.bin; IDF names the merged
+          # image merged-binary.bin.
+          cp "${BUILD_DIR}/build/merged-binary.bin" "${DIST}/firmware.bin"
 
           # Determine flash params
           FLASH_MODE="dio"; FLASH_SIZE="4MB"
@@ -138,11 +139,14 @@ jobs:
           FLASH_SIZE = "${FLASH_SIZE}"
 
           _py = sys.executable or "python3"
+          # Underscore spellings (write_flash / --flash_mode) and the default
+          # reset behaviour work on both esptool 4.x and 5.x.  The hyphenated
+          # forms are rejected by 4.x, and the underscore reset values
+          # (default_reset) are rejected by 5.x, so neither is passed here.
           cmd = [
               _py, "-m", "esptool", "--chip", TARGET,
               "-b", "460800",
-              "--before", "default-reset", "--after", "hard-reset",
-              "write-flash", "--flash-mode", FLASH_MODE, "--flash-size", FLASH_SIZE,
+              "write_flash", "--flash_mode", FLASH_MODE, "--flash_size", FLASH_SIZE,
               "0x0", os.path.join(DIR, "firmware.bin"),
           ]
 
